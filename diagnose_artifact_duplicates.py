@@ -161,45 +161,54 @@ def main() -> None:
     names = [args.name] if args.name else sorted(by_name)
     collisions = [(nm, by_name[nm]) for nm in names if nm in by_name and len(by_name[nm]) > 1]
 
-    print(f"\n[names on >1 node]: {len(collisions)}"
+    print(f"\n[names on >1 card]: {len(collisions)}"
           + ("  (each renders as multiple cards)" if collisions else ""))
-    cross_do = same_label = deleted_masks = 0
+    fanout = cross_do = same_label = deleted_masks = 0
     for nm, members in collisions:
         labels = {m[0] for m in members}
-        # What a rhino_deleted-filtering client (the fixed viewer) would still show:
+        ids = [m[1] for m in members]
+        distinct_ids = set(ids)
         visible = [m for m in members if not m[2]]
-        kind = "same-type duplicate (data)" if len(labels) == 1 else "cross-DO name collision"
-        if len(labels) > 1:
+        # THE key discriminator: same id returned more than once == the children
+        # query fanned out over multiple edges (read-layer bug, NOT real data);
+        # all-distinct ids == genuinely separate nodes (data).
+        if len(distinct_ids) < len(members):
+            kind = "READ-LAYER FAN-OUT (same node returned repeatedly)"
+            fanout += 1
+        elif len(labels) > 1:
+            kind = "cross-DO name collision (distinct types)"
             cross_do += 1
         else:
+            kind = "same-type DISTINCT duplicate nodes (data)"
             same_label += 1
         note = ""
         if len(members) > 1 and len(visible) <= 1:
             note = "  [rhino_deleted-filtering client shows 1 -> fixed there]"
             deleted_masks += 1
-        print(f'\n  "{nm}"  x{len(members)} ({len(visible)} not-deleted)  -> {kind}{note}')
+        print(f'\n  "{nm}"  x{len(members)} cards, {len(distinct_ids)} distinct id(s), '
+              f'{len(visible)} not-deleted  -> {kind}{note}')
         for label, mid, deleted in members:
-            print(f"      {label:32} deleted={'yes' if deleted else 'no':3} routine={routine_of(mid)}")
+            print(f"      {label:28} deleted={'yes' if deleted else 'no':3} "
+                  f"routine={routine_of(mid):24} id=…{mid[-24:]}")
 
     print("\n=== Verdict ===")
     if not collisions:
-        print("- No name appears on >1 node via the API. If the UI still shows duplicate cards,")
-        print("  it is a pure read-layer/render issue (e.g. a fan-out missing DISTINCT).")
+        print("- No name appears on >1 card. If the UI still shows duplicates, look elsewhere.")
     else:
-        if cross_do:
-            print(f"- {cross_do} CROSS-DO NAME COLLISION(S): the same name exists on different DO types")
-            print("  (e.g. Use Case + User Journey). Genuine distinct data; duplicate CARDS are a")
-            print("  viewer grouping/de-dup concern, not corruption.")
+        if fanout:
+            print(f"- {fanout} READ-LAYER FAN-OUT case(s): the SAME node id is returned multiple times")
+            print("  by the children query (reachable via >1 structural edge, no DISTINCT). This is a")
+            print("  VIEWER/QUERY bug — the graph holds one node; the API duplicates it. No data dup.")
         if same_label:
-            print(f"- {same_label} SAME-TYPE DUPLICATE NAME(S): repeated instances of one DO type share")
-            print("  a name — inspect whether truly duplicate data or legitimately distinct items.")
+            print(f"- {same_label} SAME-TYPE DISTINCT DUPLICATE(S): multiple REAL nodes (different ids) of one")
+            print("  DO type share a name, usually from one import/extraction routine — genuine DATA")
+            print("  duplication written at extract/import time. Needs a data-side investigation/cleanup.")
+        if cross_do:
+            print(f"- {cross_do} CROSS-DO NAME COLLISION(S): same name on different DO types (e.g. Use Case +")
+            print("  User Journey). Genuine distinct data; duplicate CARDS are a viewer grouping concern.")
         if deleted_masks:
-            print(f"- {deleted_masks} collision(s) are collapsed by rhino_deleted filtering: a viewer that")
-            print("  filters rhino_deleted shows one card; one that doesn't shows duplicates. This is")
-            print("  the 'fixed on one system, duplicated on another' signature.")
-        else:
-            print("- No collision is masked by rhino_deleted: every member is live, so a de-dup fix")
-            print("  must group by name/type in the viewer, not rely on soft-delete.")
+            print(f"- {deleted_masks} collision(s) collapse under rhino_deleted filtering (the 'fixed on one")
+            print("  system, duplicated on another' signature).")
 
 
 if __name__ == "__main__":
