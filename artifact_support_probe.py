@@ -67,6 +67,11 @@ from urllib.parse import quote
 
 import requests
 
+# Probe version — bump on behavioural changes so log output is traceable.
+#   1.0.0  initial: stuck-artifact scan + 3-way eid pagination test
+#   1.1.0  add "[Fix A backend check]" (next_cursor string vs number = deploy check)
+PROBE_VERSION = "1.1.0"
+
 JS_MAX_SAFE_INT = 2**53 - 1  # 9,007,199,254,740,991
 
 
@@ -265,6 +270,29 @@ def probe_pagination(client: RhinoClient, pid: str, *, page_size: int, big_limit
     if max_defs:
         defs = defs[:max_defs]
 
+    # --- DEPLOYMENT CHECK: is Fix A live on the backend? ---------------------
+    # The CONFIRMED verdicts below simulate the OLD browser (js_round) and always
+    # fire on data whose graphids exceed 2^53 — they do NOT test the deployment.
+    # The real backend test is whether `next_cursor` now crosses the wire as a
+    # JSON *string* (Fix A) instead of a number. We sample one paginated cursor
+    # (limit=1) and check its parsed type: str => Fix A deployed; int => not.
+    cursor_wire_type: str | None = None
+    for d in defs:
+        did = d.get("id") or d.get("definition_group_id")
+        if not did:
+            continue
+        sample = fetch_page(client, pid, did, limit=1)
+        if sample and sample.get("next_cursor") is not None:
+            cursor_wire_type = type(sample["next_cursor"]).__name__
+            break
+    if cursor_wire_type is None:
+        print("  [Fix A backend check] no paginated cursor available to sample")
+    elif cursor_wire_type == "str":
+        print("  [Fix A backend check] next_cursor is a STRING -> Fix A IS deployed on the backend")
+    else:
+        print(f"  [Fix A backend check] next_cursor is a {cursor_wire_type.upper()} "
+              "-> Fix A NOT deployed (backend still emits a numeric cursor)")
+
     results = []
     confirmed = 0
     for d in defs:
@@ -337,13 +365,16 @@ def probe_pagination(client: RhinoClient, pid: str, *, page_size: int, big_limit
     print(f"\n  -> definitions exhibiting the pagination bug: {confirmed} / "
           f"{sum(1 for x in results if x.get('paginated'))} paginated")
     return {"available": True, "definitions_total": len(defs),
-            "confirmed_definitions": confirmed, "results": results}
+            "confirmed_definitions": confirmed, "results": results,
+            "backend_cursor_wire_type": cursor_wire_type,
+            "backend_fix_a_deployed": (cursor_wire_type == "str") if cursor_wire_type else None}
 
 
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"artifact_support_probe {PROBE_VERSION}")
     p.add_argument("--base-url", required=True)
     p.add_argument("--api-prefix", default="/api", help="'/api' via frontend nginx; '' for direct backend")
     p.add_argument("--direct", action="store_true", help="Shortcut for --api-prefix ''")
@@ -373,11 +404,12 @@ def main() -> None:
         sys.exit("Provide --token or --username")
 
     pid = args.project_id
-    print(f"\n### Artifact support probe — project {pid}")
+    print(f"\n### Artifact support probe v{PROBE_VERSION} — project {pid}")
     print(f"### base={client.base_url}  page_size={args.page_size}  big_limit={args.big_limit}"
           f"  sort_by={args.sort_by or '(none/eid)'}")
 
-    summary: dict[str, Any] = {"project_id": pid, "base_url": client.base_url,
+    summary: dict[str, Any] = {"probe_version": PROBE_VERSION,
+                               "project_id": pid, "base_url": client.base_url,
                                "page_size": args.page_size, "sort_by": args.sort_by}
     if not args.skip_artifacts:
         summary["stuck_artifacts"] = probe_stuck_artifacts(client, pid)
@@ -395,8 +427,19 @@ def main() -> None:
               f"({sa['never_generated']} never-generated) of {sa['total']} artifacts.")
     pg = summary.get("pagination", {})
     if pg.get("available"):
-        print(f"  Bugs 1/3: {pg['confirmed_definitions']} DO type(s) reproduce the "
-              f"pagination duplicate/precision bug.")
+        print(f"  Bugs 1/3 (data susceptibility): {pg['confirmed_definitions']} DO type(s) have "
+              f"graphids >2^53 (this is inherent to the data and simulates the OLD browser; it is")
+        print("           NOT a deployment check).")
+        dep = pg.get("backend_fix_a_deployed")
+        wire = pg.get("backend_cursor_wire_type")
+        if dep is True:
+            print("  Fix A (backend): DEPLOYED — next_cursor is emitted as a STRING.")
+        elif dep is False:
+            print(f"  Fix A (backend): NOT DEPLOYED — next_cursor is still a {wire} (numeric).")
+        else:
+            print("  Fix A (backend): could not sample a cursor to check.")
+        print("  Note: the FRONTEND half (string handling + dedupe) can only be verified in a real")
+        print("        browser — check whether cards still duplicate/vanish in the actual UI.")
 
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as f:
