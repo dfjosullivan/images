@@ -23,8 +23,24 @@ filter is selected; see DOSelectionSpec):
 
 With no filters the script just lists what exists (safe default).
 
+IMPORTED DOs (``--imported``)
+----------------------------
+DOs written by the graph import path have no ``do_instance`` SQL rows, so
+they are invisible to the ``do-instances`` surface above. ``--imported``
+switches to the ``/graph/imported-do-instances`` endpoint, which selects
+them straight from the graph. Narrow with ``--name``/``--node-label``, or
+pass neither to remove every imported DO in the project. Same two-phase
+safety: GET the inventory, show the count, confirm, DELETE with a count
+guard.
+
+    python delete_dynamic_objects.py --base-url http://localhost:9080 --direct \
+        --project-id <uuid> --username admin --imported --name "Case Config Entity"
+
 Requires the ``graph_db`` feature to be enabled on the target backend —
 a 403 "write operations are disabled" means that flag is off.
+
+Auth: ``--username`` prompts for a password via the terminal (needs a real
+TTY — not pipeable); for non-interactive/automated runs pass ``--token``.
 
 Examples:
     # See what's there
@@ -141,6 +157,65 @@ def build_all_except_pairs(client: RhinoClient, project_id: str, excludes: list[
     return pairs
 
 
+def delete_imported(client: RhinoClient, args: argparse.Namespace) -> None:
+    """List/delete imported DOs via the /graph/imported-do-instances endpoint.
+
+    Two-phase like the main path: first GET the imported inventory and
+    resolve the count for the selection, show it, confirm, then DELETE
+    with ``expected_total`` so the server's count guard rejects a
+    delete that no longer matches.
+    """
+    base = f"/projects/{args.project_id}/graph/imported-do-instances"
+    r = client.request("GET", base)
+    if r.status_code == 403:
+        sys.exit("[imported] HTTP 403 — Graph Explorer write operations are disabled (feature 'graph_db').")
+    if r.status_code != 200:
+        sys.exit(f"[imported] listing failed: HTTP {r.status_code}: {r.text[:400]}")
+    inv = r.json()
+    by_do: dict[str, int] = inv.get("by_do", {})
+    if not by_do:
+        print("[imported] no imported DOs found in this project")
+        return
+
+    names = args.name or None
+    print("[imported] imported DOs in project:")
+    for do_name, cnt in sorted(by_do.items()):
+        print(f"    {do_name}: {cnt}")
+
+    if names:
+        wanted = {n.strip().lower() for n in names}
+        selected = {k: v for k, v in by_do.items() if k.lower() in wanted}
+        missing = wanted - {k.lower() for k in selected}
+        if missing:
+            print(f"[imported] WARNING: no DO named {sorted(missing)} (names must match a DO exactly)")
+    else:
+        selected = dict(by_do)
+
+    total = sum(selected.values())
+    print(f"[imported] selected {len(selected)} DO(s), {total} instance/child node(s): {sorted(selected)}")
+    if total == 0:
+        print("[imported] nothing matched the filter")
+        return
+
+    if not args.yes:
+        answer = input(f"Delete {total} imported node(s) (plus their containers)? "
+                       f"This cannot be undone. [y/N] ").strip().lower()
+        if answer != "y":
+            print("[imported] aborted")
+            return
+
+    body: dict[str, Any] = {"expected_total": total}
+    if names:
+        body["names"] = names
+    dr = client.request("DELETE", base, json=body)
+    if dr.status_code == 409:
+        b = dr.json()
+        sys.exit(f"[imported] count changed (expected {b.get('expected')}, now {b.get('actual')}) — re-run")
+    if dr.status_code != 200:
+        sys.exit(f"[imported] delete failed: HTTP {dr.status_code}: {dr.text[:400]}")
+    print(f"[imported] done: {json.dumps(dr.json(), indent=2)[:1500]}")
+
+
 def attempt_delete(client: RhinoClient, project_id: str, spec: dict[str, Any], expected_total: int) -> requests.Response:
     return client.request(
         "DELETE",
@@ -167,6 +242,10 @@ def main() -> None:
                         help="Select EVERY instance except DO types matching this name/label "
                              "(case-insensitive, repeatable), e.g. --all-except \"App Overview\". "
                              "Standalone mode — not combinable with the other selection filters")
+    parser.add_argument("--imported", action="store_true",
+                        help="Target IMPORTED DOs (graph-only, no do_instance rows) via the "
+                             "/graph/imported-do-instances endpoint. Use --name/--node-label to "
+                             "narrow, or neither to remove every imported DO in the project")
     parser.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
     parser.add_argument("--insecure", action="store_true", help="Skip TLS verification")
     args = parser.parse_args()
@@ -181,6 +260,10 @@ def main() -> None:
         client.login(args.username, getpass.getpass(f"Password for {args.username}: "))
     else:
         sys.exit("Provide --token or --username")
+
+    if args.imported:
+        delete_imported(client, args)
+        return
 
     spec: dict[str, Any] = {}
     if args.run_id:

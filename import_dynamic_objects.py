@@ -127,16 +127,35 @@ class RhinoClient:
 
 
 def enqueue_import(client: RhinoClient, project_id: str, payload_json: str) -> str:
-    """POST the serialized import payload; returns the task id. Waits out 429s."""
+    """POST the serialized import payload; returns the task id. Waits out 429s.
+
+    Connection errors on the POST are retried: unlike a generic POST, the
+    import is MERGE-idempotent, so a re-send after a dropped connection
+    (common over kubectl port-forward) at worst redoes the same merge or
+    trips the 429 concurrency gate — never corrupts. This is what lets a
+    port-forward blip mid-run recover instead of crashing the import.
+    """
     path = f"/projects/{project_id}/graph/import/dynamic-objects"
     size_mb = len(payload_json) / 1048576
     print(f"[import] POSTing payload ({size_mb:.1f} MB)...")
+    conn_errors = 0
     while True:
-        r = client.request(
-            "POST", path,
-            headers={"Accept": "text/event-stream", "Content-Type": "application/json"},
-            data=payload_json.encode("utf-8"),
-        )
+        try:
+            r = client.request(
+                "POST", path,
+                headers={"Accept": "text/event-stream", "Content-Type": "application/json"},
+                data=payload_json.encode("utf-8"),
+            )
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            conn_errors += 1
+            if conn_errors > 10:
+                sys.exit(f"[import] enqueue failed after {conn_errors} connection errors ({exc}). "
+                         "Check the port-forward is still up, then re-run with --start-at to resume.")
+            wait = min(5 * conn_errors, 30)
+            print(f"[import] enqueue connection error ({type(exc).__name__}); "
+                  f"retry {conn_errors} in {wait}s (import is idempotent, safe to resend)...")
+            time.sleep(wait)
+            continue
         if r.status_code == 202:
             task_id = r.json()["task_id"]
             print(f"[import] task enqueued: {task_id}")
@@ -274,6 +293,9 @@ def main() -> None:
     parser.add_argument("--include", action="append", default=[],
                         help="Import ONLY these DO names (case-insensitive; repeatable or comma-separated)")
     parser.add_argument("--poll-interval", type=float, default=5.0, help="Result poll interval in seconds")
+    parser.add_argument("--start-at", type=int, default=1,
+                        help="Resume from this 1-based payload number (batching is deterministic for the "
+                             "same file + --max-batch-mb + filters, so payload N is stable across runs)")
     parser.add_argument("--cancel-task", help="Cancel this io-task id and exit (export_file is ignored)")
     parser.add_argument("--verbose", action="store_true", help="Log every request with status and timing")
     parser.add_argument("--insecure", action="store_true", help="Skip TLS verification (intercepting proxies)")
@@ -351,8 +373,16 @@ def main() -> None:
         print(f"[import] {len(payloads)} payload(s), {total_mb:.1f} MB total, "
               f"max {max(len(p) for p in payloads) / 1048576:.1f} MB each (cap {args.max_batch_mb} MB)")
 
+    if args.start_at > 1:
+        if args.start_at > len(payloads):
+            sys.exit(f"--start-at {args.start_at} exceeds the {len(payloads)} payload(s) this file produces")
+        print(f"[import] resuming at payload {args.start_at}/{len(payloads)} "
+              f"(skipping {args.start_at - 1} already-done; re-runs are idempotent anyway)")
+
     summaries = []
     for i, payload_json in enumerate(payloads, 1):
+        if i < args.start_at:
+            continue
         print(f"[import] === payload {i}/{len(payloads)} ===")
         task_id = enqueue_import(client, project_id, payload_json)
         summary = wait_for_result(client, project_id, task_id, args.poll_interval)
