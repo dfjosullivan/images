@@ -157,6 +157,26 @@ def build_all_except_pairs(client: RhinoClient, project_id: str, excludes: list[
     return pairs
 
 
+def _load_safe_unsafe(path: str) -> tuple[set[str], set[str], list[str], list[str]]:
+    """Read a compare_imported_dos.py report and return (safe_norm, unsafe_norm,
+    safe_labels, unsafe_labels). ``verdict == 'SAFE'`` => safe; anything starting
+    with ``UNSAFE`` => unsafe. Labels are normalised for tolerant name matching."""
+    with open(path, encoding="utf-8") as fh:
+        report = json.load(fh)
+    safe: set[str] = set()
+    unsafe: set[str] = set()
+    for r in report.get("results", []):
+        verdict = str(r.get("verdict", ""))
+        label = str(r.get("do_type", ""))
+        if not label:
+            continue
+        if verdict == "SAFE":
+            safe.add(label)
+        elif verdict.startswith("UNSAFE"):
+            unsafe.add(label)
+    return {_norm(x) for x in safe}, {_norm(x) for x in unsafe}, sorted(safe), sorted(unsafe)
+
+
 def delete_imported(client: RhinoClient, args: argparse.Namespace) -> None:
     """List/delete imported DOs via the /graph/imported-do-instances endpoint.
 
@@ -190,6 +210,36 @@ def delete_imported(client: RhinoClient, args: argparse.Namespace) -> None:
             print(f"[imported] WARNING: no DO named {sorted(missing)} (names must match a DO exactly)")
     else:
         selected = dict(by_do)
+
+    # --safe-report: keep ONLY DO types the compare report marked SAFE. Fail-safe:
+    # a DO that is UNSAFE, or not present in the report at all (name mismatch),
+    # is SKIPPED rather than deleted — so we never remove a non-duplicate.
+    if getattr(args, "safe_report", None):
+        safe_norm, unsafe_norm, safe_lbls, unsafe_lbls = _load_safe_unsafe(args.safe_report)
+        print(f"[safe-only] report: {len(safe_lbls)} SAFE type(s), {len(unsafe_lbls)} UNSAFE type(s)")
+        kept: dict[str, int] = {}
+        skip_unsafe: list[str] = []
+        skip_unknown: list[str] = []
+        for k, v in selected.items():
+            nk = _norm(k)
+            if nk in unsafe_norm:
+                skip_unsafe.append(k)
+            elif nk in safe_norm:
+                kept[k] = v
+            else:
+                skip_unknown.append(k)
+        if skip_unsafe:
+            print(f"[safe-only] SKIP (UNSAFE per report): {sorted(skip_unsafe)}")
+        if skip_unknown:
+            print(f"[safe-only] SKIP (not in report / name mismatch — not deleted): {sorted(skip_unknown)}")
+        selected = kept
+        names = sorted(selected)  # restrict the DELETE to exactly the safe set
+        if not selected:
+            print("[safe-only] no imported DO matched a SAFE type — nothing to delete. "
+                  "(If the inventory has items, the report do_type names may not match the "
+                  "imported DO names; delete those explicitly with --name instead.)")
+            return
+        print(f"[safe-only] proceeding with {len(selected)} SAFE type(s): {names}")
 
     total = sum(selected.values())
     print(f"[imported] selected {len(selected)} DO(s), {total} instance/child node(s): {sorted(selected)}")
@@ -246,6 +296,11 @@ def main() -> None:
                         help="Target IMPORTED DOs (graph-only, no do_instance rows) via the "
                              "/graph/imported-do-instances endpoint. Use --name/--node-label to "
                              "narrow, or neither to remove every imported DO in the project")
+    parser.add_argument("--safe-report",
+                        help="Path to a compare_imported_dos.py --json-out report. With --imported, "
+                             "delete ONLY imported DO types the report marked SAFE (identical to their "
+                             "native twin); UNSAFE-DIFF/UNSAFE-ORPHAN types and any DO not in the report "
+                             "are skipped. Fail-safe: never deletes a non-duplicate.")
     parser.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
     parser.add_argument("--insecure", action="store_true", help="Skip TLS verification")
     args = parser.parse_args()
@@ -260,6 +315,9 @@ def main() -> None:
         client.login(args.username, getpass.getpass(f"Password for {args.username}: "))
     else:
         sys.exit("Provide --token or --username")
+
+    if args.safe_report and not args.imported:
+        sys.exit("--safe-report only applies with --imported")
 
     if args.imported:
         delete_imported(client, args)
