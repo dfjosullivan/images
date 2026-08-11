@@ -60,7 +60,8 @@ import requests
 
 # Bump on behavioural changes so log output is traceable.
 #   1.0.0  initial: per-DO-type imported-vs-native compare + safe-delete verdict
-SCRIPT_VERSION = "1.0.0"
+#   1.1.0  add --strict (compare link uuids literally, not just project prefixes)
+SCRIPT_VERSION = "1.1.0"
 
 _UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 _COMPARE_IGNORE = {"id", "project_id"}
@@ -144,26 +145,32 @@ def pair_key(item_id: str) -> str:
     return item_id.split(":", 1)[1] if ":" in item_id else item_id
 
 
-def normalize_field(value: Any, projs: set[str]) -> str:
+def normalize_field(value: Any, projs: set[str], strict: bool = False) -> str:
     s = json.dumps(value, sort_keys=True, default=str)
     for p in projs:
         if p:
             s = s.replace(p, "<PROJ>")
-    # also neutralise any stray uuid so prefix-only link diffs are not flagged
+    if strict:
+        # strict: only the project prefixes are normalised. Any other uuid — e.g.
+        # a link pointing at a genuinely different node — stays literal and WILL
+        # be flagged as a difference.
+        return s
+    # lenient (default): also neutralise any remaining uuid so a link that only
+    # differs by an embedded project prefix is not treated as a content change.
     return _UUID_RE.sub("<UUID>", s)
 
 
-def diff_fields(native: dict, foreign: dict, projs: set[str]) -> set[str]:
+def diff_fields(native: dict, foreign: dict, projs: set[str], strict: bool = False) -> set[str]:
     keys = (set(native) | set(foreign)) - _COMPARE_IGNORE
     out = set()
     for k in keys:
-        if normalize_field(native.get(k), projs) != normalize_field(foreign.get(k), projs):
+        if normalize_field(native.get(k), projs, strict) != normalize_field(foreign.get(k), projs, strict):
             out.add(k)
     return out
 
 
 def analyse_definition(client: RhinoClient, pid: str, definition: dict, page_size: int,
-                       show_diffs: bool) -> dict[str, Any]:
+                       show_diffs: bool, strict: bool = False) -> dict[str, Any]:
     def_id = definition.get("id") or definition.get("definition_group_id")
     label = definition.get("node_label") or definition.get("name") or def_id
     items = fetch_all_items(client, pid, def_id, page_size)
@@ -190,7 +197,7 @@ def analyse_definition(client: RhinoClient, pid: str, definition: dict, page_siz
             orphans.append(key)
             continue
         for fc in fcopies:
-            d = diff_fields(nat, fc, foreign_projects | {pid})
+            d = diff_fields(nat, fc, foreign_projects | {pid}, strict)
             if d:
                 rec = {"pair_key": key, "fields": sorted(d)}
                 if show_diffs:
@@ -232,6 +239,10 @@ def main() -> None:
     p.add_argument("--max-defs", type=int, help="Only analyse the first N definitions")
     p.add_argument("--only-foreign", action="store_true", help="Skip DO types that have no imported items")
     p.add_argument("--show-diffs", action="store_true", help="Include the differing field values in output")
+    p.add_argument("--strict", action="store_true",
+                   help="Only normalise the native/foreign project prefixes; compare all other uuids "
+                        "literally (flags links that point at genuinely different nodes). Default is "
+                        "lenient (all uuids normalised, so only content changes are flagged).")
     p.add_argument("--json-out", help="Write the full machine-readable report here")
     p.add_argument("--insecure", action="store_true", help="Skip TLS verification")
     args = p.parse_args()
@@ -249,7 +260,7 @@ def main() -> None:
 
     pid = args.project_id
     print(f"\n### compare_imported_dos v{SCRIPT_VERSION} — project {pid}")
-    print(f"### base={client.base_url}")
+    print(f"### base={client.base_url}  mode={'STRICT (uuid-literal)' if args.strict else 'lenient (uuid-normalised)'}")
 
     r = client.get("/dynamic-objects/definitions", params={"project_id": pid})
     if r.status_code != 200:
@@ -263,7 +274,7 @@ def main() -> None:
     for d in defs:
         if not (d.get("id") or d.get("definition_group_id")):
             continue
-        res = analyse_definition(client, pid, d, args.page_size, args.show_diffs)
+        res = analyse_definition(client, pid, d, args.page_size, args.show_diffs, args.strict)
         if args.only_foreign and res["foreign"] == 0:
             continue
         results.append(res)
