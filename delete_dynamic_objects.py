@@ -247,6 +247,11 @@ def delete_imported(client: RhinoClient, args: argparse.Namespace) -> None:
         print("[imported] nothing matched the filter")
         return
 
+    if getattr(args, "dry_run", False):
+        print(f"[dry-run] would delete {total} imported node(s) across {len(selected)} DO(s): {sorted(selected)}")
+        print("[dry-run] no changes made. Re-run without --dry-run to delete.")
+        return
+
     if not args.yes:
         answer = input(f"Delete {total} imported node(s) (plus their containers)? "
                        f"This cannot be undone. [y/N] ").strip().lower()
@@ -301,6 +306,9 @@ def main() -> None:
                              "delete ONLY imported DO types the report marked SAFE (identical to their "
                              "native twin); UNSAFE-DIFF/UNSAFE-ORPHAN types and any DO not in the report "
                              "are skipped. Fail-safe: never deletes a non-duplicate.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Resolve and report exactly what WOULD be deleted (counts + selection), "
+                             "then exit without deleting anything. No prompt, no changes.")
     parser.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
     parser.add_argument("--insecure", action="store_true", help="Skip TLS verification")
     args = parser.parse_args()
@@ -365,6 +373,9 @@ def main() -> None:
 
     print(f"[delete] selection spec: {json.dumps(spec)}")
     print(f"[delete] matches {actual} instance(s) in project {args.project_id}")
+    if args.dry_run:
+        print("[dry-run] no changes made. Re-run without --dry-run to delete.")
+        return
     if not args.yes:
         answer = input(f"Delete {actual} instance(s)? This cannot be undone. [y/N] ").strip().lower()
         if answer != "y":
