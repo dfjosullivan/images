@@ -152,7 +152,7 @@ def _graph_label_tables(conn: psycopg.Connection, graph: str) -> tuple[list[str]
             SELECT tablename
             FROM pg_tables
             WHERE schemaname = %s AND tableowner = current_user
-            ORDER BY pg_total_relation_size(format('%I.%I', schemaname, tablename)::regclass) DESC
+            ORDER BY pg_total_relation_size(format('%%I.%%I', schemaname, tablename)::regclass) DESC
             """,
             (graph,),
         )
