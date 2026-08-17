@@ -124,14 +124,24 @@ def _prepare_session(conn: psycopg.Connection, lock_timeout_s: int) -> None:
 
 
 def _owned_public_tables(conn: psycopg.Connection) -> list[str]:
-    """Relational app tables in ``public`` owned by the current role."""
+    """All relational app tables in ``public``.
+
+    Deliberately NOT filtered by ``tableowner = current_user``: on dev01 the
+    Entra service principal owns only the newer tables, while core tables
+    (``knowledge_reserve``, ``projects``, …) belong to an older role — the
+    owner filter silently excluded exactly the table this script exists for.
+    Instead every table is attempted and ``InsufficientPrivilege`` is caught
+    per-table and reported as a skip.  On PG16 VACUUM/ANALYZE succeed for the
+    owner or a member of the owning role (the Entra principal is typically a
+    member of the ``rhino_rw`` group role, so membership usually suffices);
+    the MAINTAIN privilege only exists from PG17.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT format('%I.%I', schemaname, tablename)
             FROM pg_tables
             WHERE schemaname = 'public'
-              AND tableowner = current_user
             ORDER BY pg_total_relation_size(format('%I.%I', schemaname, tablename)::regclass) DESC
             """
         )
@@ -151,7 +161,7 @@ def _graph_label_tables(conn: psycopg.Connection, graph: str) -> tuple[list[str]
             """
             SELECT tablename
             FROM pg_tables
-            WHERE schemaname = %s AND tableowner = current_user
+            WHERE schemaname = %s
             ORDER BY pg_total_relation_size(format('%%I.%%I', schemaname, tablename)::regclass) DESC
             """,
             (graph,),
@@ -295,8 +305,17 @@ def main() -> int:
                 analyze_only_extra.extend(parents)
 
         if not targets and not analyze_only_extra:
-            print("ERROR: no owned tables found for the selected scope", file=sys.stderr)
+            print("ERROR: no tables found for the selected scope", file=sys.stderr)
             return 2
+
+        public_in_scope = bool(args.tables) or args.everything or not args.graph
+        if public_in_scope and not any(
+            t.endswith("knowledge_reserve") for t in targets
+        ):
+            print(
+                "WARNING: knowledge_reserve is not among the targets — "
+                "the [KR_STATS] live_tuples=0 problem will NOT be fixed by this run."
+            )
 
         mode = "ANALYZE" if args.analyze_only else "VACUUM (ANALYZE)"
         print(
