@@ -63,11 +63,22 @@ _TOP_N = 15
 
 
 def _connect() -> psycopg.Connection:
-    conninfo = get_age_conninfo()
-    kwargs: dict[str, str] = {}
+    conn_kwargs: dict[str, str] = {}
     if get_age_db_auth() == "entra":
-        kwargs["password"] = fetch_age_entra_token()
-    return psycopg.connect(conninfo, autocommit=True, **kwargs)
+        conn_kwargs["password"] = fetch_age_entra_token()
+    conn = psycopg.connect(get_age_conninfo(), autocommit=True, **conn_kwargs)
+    # agtype's ->> operator lives in ag_catalog; without it on the search_path
+    # every properties->>'"id"' probe fails (this is why an earlier run skipped
+    # section 3 with "could not sample a node id").
+    with conn.cursor() as cur:
+        # SET cannot take bind parameters — compose the identifier safely.
+        from psycopg import sql as _sql
+        cur.execute(
+            _sql.SQL("SET search_path = ag_catalog, {}, public").format(
+                _sql.Identifier(get_age_graph_name())
+            )
+        )
+    return conn
 
 
 def _rows(conn, query, params=None):
@@ -222,45 +233,67 @@ def section_plans(conn, graph: str, deep: bool) -> None:
         print(f"  timed out / failed: {str(ex).splitlines()[0]}")
 
 
-def section_seq_scans(conn, graph: str) -> list[str]:
+def section_seq_scans(conn, graph: str) -> tuple[list[str], list[str]]:
+    """Return (hot vertex label tables, hot edge tables) by seq-scan volume."""
     _banner("4. WHO GETS FULL-SCANNED (pg_stat seq_scan counters)")
     rows = _rows(
         conn,
         """
-        SELECT schemaname || '.' || relname, seq_scan, seq_tup_read, idx_scan
-        FROM pg_stat_all_tables
-        WHERE schemaname IN ('public', %s) AND seq_scan > 0
-        ORDER BY seq_tup_read DESC LIMIT %s
+        SELECT s.schemaname || '.' || s.relname, s.seq_scan, s.seq_tup_read, s.idx_scan,
+               EXISTS (SELECT 1 FROM pg_inherits i
+                       WHERE i.inhrelid = (s.schemaname || '.' || quote_ident(s.relname))::regclass
+                         AND i.inhparent = (quote_ident(s.schemaname) || '._ag_label_edge')::regclass
+                      ) AS is_edge
+        FROM pg_stat_all_tables s
+        WHERE s.schemaname IN ('public', %s) AND s.seq_scan > 0
+        ORDER BY s.seq_tup_read DESC LIMIT %s
         """,
         (graph, _TOP_N),
     )
-    print(f"{'table':50s} {'seq_scans':>10s} {'rows_read_by_seq':>17s} {'idx_scans':>10s}")
-    hot: list[str] = []
-    for name, seq, tup, idx_scan in rows:
-        print(f"{name:50s} {seq:>10} {tup:>17} {idx_scan if idx_scan is not None else 0:>10}")
+    print(f"{'table':50s} {'seq_scans':>10s} {'rows_read_by_seq':>17s} {'idx_scans':>10s}  kind")
+    hot_vertex: list[str] = []
+    hot_edge: list[str] = []
+    for name, seq, tup, idx_scan, is_edge in rows:
+        kind = "edge" if is_edge else ("vertex" if name.startswith(f"{graph}.") else "sql")
+        print(f"{name:50s} {seq:>10} {tup:>17} {idx_scan if idx_scan is not None else 0:>10}  {kind}")
         if name.startswith(f"{graph}."):
-            hot.append(name.split(".", 1)[1])
-    return hot
+            (hot_edge if is_edge else hot_vertex).append(name.split(".", 1)[1])
+    return hot_vertex, hot_edge
 
 
-def section_candidates(hot_labels: list[str], graph: str, have_prop_idx: bool) -> None:
+def section_candidates(
+    hot_vertex: list[str],
+    hot_edge: list[str],
+    graph: str,
+    have_prop_idx: bool,
+    start_id_tables: set[str],
+) -> None:
     _banner("5. CANDIDATE FIXES (paste into a migration after review)")
-    if have_prop_idx:
-        print("Shape A expression indexes already exist on some labels — verify coverage vs")
-        print("the hot list above before adding more.")
-    print("Shape A — expression index per HOT label table (parent indexes don't inherit):\n")
-    for label in hot_labels[:10] or ["<hot label tables from section 4>"]:
+    if hot_edge:
+        print("EDGE tables dominate the seq-scan volume — index their join keys first:\n")
+        for label in hot_edge[:10]:
+            marker = "  -- already has a start_id index?!" if label in start_id_tables else ""
+            print(
+                f'  CREATE INDEX CONCURRENTLY IF NOT EXISTS "ix_{label.lower()}_start_id"\n'
+                f'    ON {graph}."{label}" (start_id);{marker}\n'
+                f'  CREATE INDEX CONCURRENTLY IF NOT EXISTS "ix_{label.lower()}_end_id"\n'
+                f'    ON {graph}."{label}" (end_id);'
+            )
         print(
-            f'  CREATE INDEX CONCURRENTLY IF NOT EXISTS "ix_{label.lower()}_prop_id"\n'
-            f'    ON {graph}."{label}" ((properties->>\'"id"\'));'
+            "\n  ...and anchor the relationship label in Cypher instead of type(r) IN [...]:\n"
+            "  MATCH (item:Label)-[r:HAS_RHINO_CITATIONS]->(child)   -- scans 1 edge table"
         )
-    print(
-        "\nShape B — anchor the relationship label in Cypher instead of type(r) IN [...]:\n"
-        "  MATCH (item:Label)-[r:HAS_RHINO_CITATIONS]->(child)   -- scans 1 edge table\n"
-        "and index hot edge tables' start_id where missing:\n"
-        f'  CREATE INDEX CONCURRENTLY IF NOT EXISTS "ix_<edge>_start_id"\n'
-        f'    ON {graph}."<EDGE_TABLE>" (start_id);'
-    )
+    if hot_vertex:
+        if have_prop_idx:
+            print("\nVertex labels below are seq-scanned despite the prop-id indexes existing on")
+            print("many labels — check section 2 coverage for THESE specific labels:")
+        else:
+            print("\nVertex label expression indexes (parents don't inherit):")
+        for label in hot_vertex[:10]:
+            print(
+                f'  CREATE INDEX CONCURRENTLY IF NOT EXISTS "ix_{label.lower()}_prop_id"\n'
+                f'    ON {graph}."{label}" ((properties->>\'"id"\'));'
+            )
     print(
         "\nLive-traffic plan capture (no code changes): set KG_AGE_EXPLAIN_SLOW=true on the\n"
         "backend deployment — every `age.query SLOW` line then logs its EXPLAIN ANALYZE plan."
@@ -285,10 +318,10 @@ def main() -> int:
     graph = get_age_graph_name()
     try:
         section_context(conn, graph)
-        have_prop_idx, _ = section_indexes(conn, graph)
+        have_prop_idx, start_id_tables = section_indexes(conn, graph)
         section_plans(conn, graph, deep=args.deep)
-        hot = section_seq_scans(conn, graph)
-        section_candidates(hot, graph, have_prop_idx)
+        hot_vertex, hot_edge = section_seq_scans(conn, graph)
+        section_candidates(hot_vertex, hot_edge, graph, have_prop_idx, start_id_tables)
         return 0
     finally:
         conn.close()
