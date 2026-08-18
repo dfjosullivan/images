@@ -50,3 +50,5 @@ kubectl exec rhino-backend-0 -n rhino -c backend -- sh -c 'ls scripts/vacuum_ana
 If MISSING, no problem — pipe it in with the standard pattern (args go after the -):                                                                                                                                                                                                                             
                                                                                                                                                                                                                                                                                                                
 (Get-Content C:\Users\denis\PycharmProjects\rhino\DigitalTransformerBackend\scripts\vacuum_analyze.py -Raw) -replace "`r","" | kubectl exec -i rhino-backend-0 -n rhino -c backend -- python - --dry-run      
+
+Get-Content -Raw DigitalTransformerBackend\scripts\diagnose_slow_graph_queries.py | kubectl exec -i rhino-backend-0 -- python -u -   
