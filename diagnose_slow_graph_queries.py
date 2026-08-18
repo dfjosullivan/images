@@ -206,9 +206,12 @@ def section_plans(conn, graph: str, deep: bool) -> None:
           "Every children/ref-batch call pays all of them.")
 
     print("\n--- Shape B generic edge scan by start vertex, EXPLAIN (costs only): ---")
+    # start_id is AGE's graphid type — no graphid = integer operator exists, so
+    # compare against a real value sampled from the table itself (graphid = graphid).
     plan = _rows(
         conn,
-        f"EXPLAIN SELECT * FROM {graph}._ag_label_edge WHERE start_id = 0",
+        f"EXPLAIN SELECT * FROM {graph}._ag_label_edge WHERE start_id = "
+        f"(SELECT start_id FROM {graph}._ag_label_edge LIMIT 1)",
     )
     appends = sum(1 for (line,) in plan if "Seq Scan" in line)
     print(f"  plan is {len(plan)} lines; {appends} sequential scans — an unanchored -[r]-> "
@@ -317,12 +320,32 @@ def main() -> int:
 
     graph = get_age_graph_name()
     try:
-        section_context(conn, graph)
-        have_prop_idx, start_id_tables = section_indexes(conn, graph)
-        section_plans(conn, graph, deep=args.deep)
-        hot_vertex, hot_edge = section_seq_scans(conn, graph)
+        # Each section is independent evidence — never let one failure kill the rest.
+        failed = 0
+        have_prop_idx, start_id_tables = False, set()
+        hot_vertex, hot_edge = [], []
+        try:
+            section_context(conn, graph)
+        except psycopg.Error as ex:
+            failed += 1
+            print(f"  section 1 failed: {str(ex).splitlines()[0]}")
+        try:
+            have_prop_idx, start_id_tables = section_indexes(conn, graph)
+        except psycopg.Error as ex:
+            failed += 1
+            print(f"  section 2 failed: {str(ex).splitlines()[0]}")
+        try:
+            section_plans(conn, graph, deep=args.deep)
+        except psycopg.Error as ex:
+            failed += 1
+            print(f"  section 3 failed: {str(ex).splitlines()[0]}")
+        try:
+            hot_vertex, hot_edge = section_seq_scans(conn, graph)
+        except psycopg.Error as ex:
+            failed += 1
+            print(f"  section 4 failed: {str(ex).splitlines()[0]}")
         section_candidates(hot_vertex, hot_edge, graph, have_prop_idx, start_id_tables)
-        return 0
+        return 1 if failed else 0
     finally:
         conn.close()
 
