@@ -27,12 +27,16 @@ Sections:
 single lookup + a 5-id batch (expect ~10-20s each on dev01 — that IS the
 finding).
 
-Usage (pod image predates this file — pipe over stdin):
+Usage (pod image predates this file — pipe over stdin; strip CRLF, name the
+namespace and container explicitly — the pod also runs istio-proxy):
 
-  Get-Content -Raw DigitalTransformerBackend\\scripts\\diagnose_slow_graph_queries.py |
-    kubectl exec -i rhino-backend-0 -- python -u -
+  (Get-Content -Raw DigitalTransformerBackend\\scripts\\diagnose_slow_graph_queries.py) -replace "`r","" |
+    kubectl exec -i -n rhino rhino-backend-0 -c backend -- python -u -
 
-  ... | kubectl exec -i rhino-backend-0 -- python -u - --deep
+  # deep pass + greppable UTF-8 capture:
+  (Get-Content -Raw ...\\diagnose_slow_graph_queries.py) -replace "`r","" |
+    kubectl exec -i -n rhino rhino-backend-0 -c backend -- python -u - --deep |
+    Tee-Object -FilePath images\\diagnose_rhino_log.txt
 
 Also note the app's built-in switch: setting ``KG_AGE_EXPLAIN_SLOW=true`` on
 the deployment makes ``age_session`` log an EXPLAIN ANALYZE plan alongside
