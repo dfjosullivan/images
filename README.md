@@ -1,5 +1,5 @@
 
-helm upgrade --install aks-istio-tls-sync .\aks-istio-tls-sync -n aks-istio-ingress -f .\values\keyvault-cert-sync-values.yaml
+helm upgrade --install aks-istio-tls-sync .\aks-istio-tls-sync -n rhino -f .\values\keyvault-cert-sync-values.yaml
 
 Save (one archive, multiple images)                                                                                                                                                                                                                                                                               
                                                                                                                                                                                                                                                                                                                     
