@@ -1,4 +1,6 @@
 
+helm upgrade --install aks-istio-tls-sync .\aks-istio-tls-sync -n aks-istio-ingress -f .\values\keyvault-cert-sync-values.yaml
+
 Save (one archive, multiple images)                                                                                                                                                                                                                                                                               
                                                                                                                                                                                                                                                                                                                     
 docker save rhino/backend:3.07.01 rhino/worker:3.07.01 rhino/frontend:3.04.22 -o rhino-3.07.01-images.tar                                                                                                                                                                                                         
