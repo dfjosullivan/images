@@ -54,3 +54,12 @@ If MISSING, no problem — pipe it in with the standard pattern (args go after t
 (Get-Content C:\Users\denis\PycharmProjects\rhino\DigitalTransformerBackend\scripts\vacuum_analyze.py -Raw) -replace "`r","" | kubectl exec -i rhino-backend-0 -n rhino -c backend -- python - --dry-run      
 
 (Get-Content -Raw DigitalTransformerBackend\scripts\diagnose_slow_graph_queries.py) -replace "`r","" | kubectl exec -i -n rhino rhino-backend-0 -c backend -- python -u - --deep
+
+
+# on the restricted system — API access only                                                                                                                                                                                                                                                                      
+  python artifact_bundle.py import --base-url https://<target-env> `                                                                                                                                                                                                                                                
+    --project-id <target-project> --token <target-token> `                                                                                                                                                                                                                                                          
+    --bundle bundle.zip --import-dos                                                                                                                                                                                                                                                                                
+                                                                                                                                                                                                                                                                                                                    
+  The --align / --align-psql flags remain in the script purely as fallbacks for the case where DOs were imported through the UI (like your original local run) — with --import-dos they're unnecessary. One caveat to know: if the target project was already populated via a UI import (your local b28946c4 case), 
+  don't add --import-dos on top — you'd duplicate the data; that project is already fixed and needs nothing further.
