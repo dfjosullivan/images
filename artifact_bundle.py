@@ -522,6 +522,31 @@ def _run_graph_alignment(exec_prefix: str, pid: str) -> None:
           f"stamped project_id on {result['stamped']} imported item node(s)")
 
 
+def _delete_imported_dos(client: RhinoClient, pid: str) -> None:
+    """Remove previously imported DO nodes so a re-import replaces cleanly.
+
+    Uses the imported-do-instances surface (selects ``_imported: true``
+    containers scoped to the project). On environments without that
+    endpoint the re-import falls back to MERGE semantics: existing nodes
+    are updated in place, new ones added, but nodes deleted at the source
+    linger in the target.
+    """
+    url = f"{client.api}/projects/{pid}/graph/imported-do-instances"
+    resp = client.session.get(url, timeout=DEFAULT_TIMEOUT)
+    if resp.status_code != 200 or "json" not in (resp.headers.get("Content-Type") or ""):
+        print(f"  WARNING: imported-do-instances endpoint unavailable ({resp.status_code}); "
+              "skipping delete -- re-import will merge/update in place instead")
+        return
+    info = resp.json()
+    print(f"  replacing previously imported DOs: {json.dumps(info)[:250]}")
+    dresp = client.session.delete(url, json={}, timeout=600)
+    if dresp.status_code < 400:
+        print(f"    deleted: {dresp.text[:250]}")
+    else:
+        print(f"    WARNING: delete failed ({dresp.status_code}): {dresp.text[:250]} -- "
+              "continuing; re-import will merge/update in place")
+
+
 def _target_label_map(client: RhinoClient, pid: str) -> dict[str, str]:
     """node_label -> definition_group_id for every definition in the target."""
     listed = client.get("/dynamic-objects/definitions", params={"project_id": pid})
@@ -739,12 +764,35 @@ def _create_type_payload(source: dict[str, Any], member_id_map: dict[str, str]) 
 
 
 def _ensure_type(client: RhinoClient, pid: str, source: dict[str, Any],
-                 existing_by_key: dict[str, dict[str, Any]], member_id_map: dict[str, str]) -> str:
-    """Return the target-environment id for the given source type, creating it if needed."""
+                 existing_by_key: dict[str, dict[str, Any]], member_id_map: dict[str, str],
+                 update: bool = False) -> str:
+    """Return the target-environment id for the given source type, creating it if needed.
+
+    With ``update=True`` an existing non-SYSTEM type is PATCHed with the
+    bundle's content (template/component_source/nav_sections/...), so a
+    re-import refreshes the rendering instead of silently keeping the old one.
+    """
     key = source["key"]
     if key in existing_by_key:
         found = existing_by_key[key]
-        print(f"  type {key!r} already exists in target ({found.get('scope')}), reusing id {found['id']}")
+        if update and found.get("scope") == "SYSTEM":
+            print(f"  type {key!r} is SYSTEM in target; cannot update, reusing as-is")
+        elif update:
+            print(f"  updating existing type {key!r} ({found['id']}) from bundle ...")
+            payload = _create_type_payload(source, member_id_map)
+            payload.pop("key", None)  # key is immutable; PATCH rejects unknown handling
+            url = f"{client.api}/projects/{pid}/artifact-types/{found['id']}"
+            resp = client.session.patch(url, json=payload, timeout=DEFAULT_TIMEOUT)
+            if resp.status_code == 400 and "routine" in resp.text.lower():
+                print(f"    unknown routine name(s) ({resp.text[:150]}); retrying with routine_names=[]")
+                payload["routine_names"] = []
+                resp = client.session.patch(url, json=payload, timeout=DEFAULT_TIMEOUT)
+            if resp.status_code >= 400:
+                print(f"    WARNING: type update failed ({resp.status_code}): {resp.text[:300]}")
+            else:
+                print("    type updated")
+        else:
+            print(f"  type {key!r} already exists in target ({found.get('scope')}), reusing id {found['id']}")
         return found["id"]
     print(f"  creating type {key!r} (render_mode={source.get('render_mode')}) ...")
     payload = _create_type_payload(source, member_id_map)
@@ -788,7 +836,12 @@ def cmd_import(args: argparse.Namespace) -> None:
     listed = client.get(f"/projects/{pid}/artifact-types?include_drafts=true")
     existing_by_key = {t["key"]: t for t in listed}
     types_to_create = (
-        [t for t in [*member_types, artifact_type] if t.get("key") not in existing_by_key]
+        [
+            t for t in [*member_types, artifact_type]
+            # --update-type PATCHes existing types too, so their labels also
+            # need definitions ensured (and unresolved sections stripped).
+            if t.get("key") not in existing_by_key or args.update_type
+        ]
         if artifact_type is not None and artifact_type.get("scope") != "SYSTEM"
         else []
     )
@@ -815,6 +868,8 @@ def cmd_import(args: argparse.Namespace) -> None:
     if args.import_dos:
         if dos_envelope is None:
             sys.exit("--import-dos given but the bundle has no dynamic_objects.json")
+        if args.replace_dos:
+            _delete_imported_dos(client, pid)
         label_map = _target_label_map(client, pid)
         rewritten = _rewrite_envelope_for_target(dos_envelope, pid, label_map)
         src_pid = dos_envelope.get("project_id") or manifest.get("source_project_id")
@@ -835,8 +890,10 @@ def cmd_import(args: argparse.Namespace) -> None:
     if artifact_type is not None and artifact_type.get("scope") != "SYSTEM":
         member_id_map: dict[str, str] = {}
         for member in member_types:  # members first so the composite can reference them
-            member_id_map[member["id"]] = _ensure_type(client, pid, member, existing_by_key, {})
-        _ensure_type(client, pid, artifact_type, existing_by_key, member_id_map)
+            member_id_map[member["id"]] = _ensure_type(
+                client, pid, member, existing_by_key, {}, update=args.update_type
+            )
+        _ensure_type(client, pid, artifact_type, existing_by_key, member_id_map, update=args.update_type)
     elif artifact_type is not None:
         if type_key not in existing_by_key:
             print(f"  WARNING: SYSTEM type {type_key!r} not seeded in target -- "
@@ -844,11 +901,21 @@ def cmd_import(args: argparse.Namespace) -> None:
     elif type_key not in existing_by_key:
         print(f"  WARNING: bundle has no type definition and target has no type {type_key!r}")
 
-    # 3. Create the artifact record and mark it complete.
+    # 3. Create (or reuse) the artifact record and mark it complete. Reuse on
+    #    an exact name+type match keeps repeated imports/updates idempotent.
     name = args.name or artifact.get("name") or type_key
-    print(f"Creating artifact {name!r} ...")
-    created = client.post(f"/projects/{pid}/artifacts", {"artifact_type": type_key, "name": name})
-    artifact_id = created["id"]
+    existing_artifacts = client.get(f"/projects/{pid}/artifacts")
+    match = next(
+        (a for a in existing_artifacts if a.get("name") == name and a.get("artifact_type") == type_key),
+        None,
+    )
+    if match:
+        artifact_id = match["id"]
+        print(f"Artifact {name!r} already exists ({artifact_id}); reusing it")
+    else:
+        print(f"Creating artifact {name!r} ...")
+        created = client.post(f"/projects/{pid}/artifacts", {"artifact_type": type_key, "name": name})
+        artifact_id = created["id"]
     client.patch(f"/projects/{pid}/artifacts/{artifact_id}", {"status": "complete"})
 
     # 4. Graph repair -- only needed when the DOs were imported OUTSIDE this
@@ -916,6 +983,14 @@ def main() -> None:
     _add_common(imp)
     imp.add_argument("--bundle", default="artifact_bundle.zip", help="Bundle zip produced by 'export'")
     imp.add_argument("--import-dos", action="store_true", help="Also import the bundled Dynamic Objects")
+    imp.add_argument("--replace-dos", action="store_true",
+                     help="With --import-dos: delete previously imported DOs first so the re-import "
+                          "replaces them (otherwise re-import merges in place and source-side "
+                          "deletions linger)")
+    imp.add_argument("--update-type", action="store_true",
+                     help="PATCH an existing artifact type with the bundle's template/component/"
+                          "nav_sections instead of reusing it unchanged (use when refreshing "
+                          "an artifact to a newer version)")
     imp.add_argument("--definitions-file",
                      help="DO export JSON (e.g. downloaded from the Graph Explorer Export modal) to "
                           "source missing DO definitions from, in addition to the bundle")
