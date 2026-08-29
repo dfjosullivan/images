@@ -69,3 +69,8 @@ python artifact_bundle.py poll `
     --project-id ccf0baf6-0971-4138-a320-c2a282d1c24a `                                                                                                                                                                                                                                                             
     --task-id f0166294-a434-4267-8a8e-1d8f4aca8ef5 `                                                                                                                                                                                                                                                                
     --token <token>
+
+
+python artifact_bundle.py import `                                                                                                                                                                                                                                                                                
+    --base-url <external-base-url> --project-id ccf0baf6-0971-4138-a320-c2a282d1c24a `                                                                                                                                                                                                                              
+    --token <token> --bundle artifact_bundle_v2.zip --update-type    
