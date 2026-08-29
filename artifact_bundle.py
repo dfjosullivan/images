@@ -635,6 +635,27 @@ def _rewrite_envelope_for_target(envelope: dict[str, Any], pid: str, label_map: 
     this the imported nodes keep the SOURCE environment's ids and the
     artifact viewer's items query filters them all out.
     """
+    def _strip_label_suffix(node: dict[str, Any]) -> None:
+        """Rewrite suffixed item labels (routine writes: ``Label_8hex``) to bare.
+
+        The target's items query pins the LOCAL definition's suffix plus the
+        bare label; a SOURCE-env suffix matches neither, so routine-produced
+        items would be invisible. Only strips when the bare label is a known
+        definition, so unrelated underscored labels pass through untouched.
+        """
+        node_type = node.get("type")
+        if isinstance(node_type, str) and "_" in node_type:
+            bare, _, suffix = node_type.rpartition("_")
+            if bare in label_map and len(suffix) == 8 and all(c in "0123456789abcdef" for c in suffix):
+                node["type"] = bare
+        for item in node.get("items") or []:
+            if isinstance(item, dict):
+                _strip_label_suffix(item)
+        for child_list in (node.get("children") or {}).values():
+            for child in child_list or []:
+                if isinstance(child, dict):
+                    _strip_label_suffix(child)
+
     count = 0
     for do in envelope.get("dynamic_objects") or []:
         props = do.get("properties")
@@ -643,6 +664,7 @@ def _rewrite_envelope_for_target(envelope: dict[str, Any], pid: str, label_map: 
             if label and label in label_map:
                 props["definition_group_id"] = label_map[label]
         _stamp_node_tree(do, pid)
+        _strip_label_suffix(do)
         count += 1
     # full-graph scope payloads carry flat nodes instead of DO trees.
     for node in envelope.get("nodes") or []:
