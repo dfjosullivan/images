@@ -763,21 +763,227 @@ def _strip_unknown_sections(types: list[dict[str, Any]], unresolved: set[str]) -
             t["nav_sections"] = kept
 
 
+_IMPORT_RE = None  # compiled lazily; see _parse_imports
+
+
+def _parse_imports(code: str) -> list[tuple[str, str]]:
+    """Return (full_import_statement, module_specifier) pairs found in *code*."""
+    import re
+    global _IMPORT_RE  # noqa: PLW0603
+    if _IMPORT_RE is None:
+        _IMPORT_RE = re.compile(
+            r"^import\s+(?:[^;'\"]|\n)*?from\s*[\"']([^\"']+)[\"'];?[^\S\n]*$"
+            r"|^import\s*[\"']([^\"']+)[\"'];?[^\S\n]*$",
+            re.MULTILINE,
+        )
+    out = []
+    for m in _IMPORT_RE.finditer(code):
+        out.append((m.group(0), m.group(1) or m.group(2)))
+    return out
+
+
+def _norm_module_path(importer: str, spec: str) -> str:
+    """Resolve a relative import spec against the importer's path."""
+    import posixpath
+    base = posixpath.dirname(importer)
+    resolved = posixpath.normpath(posixpath.join(base, spec))
+    return resolved.lstrip("./")
+
+
+def flatten_component(component_source: str, source_files: list[dict[str, str]]) -> str:
+    """Inline 3.0.9 multi-file sandbox modules into one component for 3.0.7 hosts.
+
+    The 3.0.9 sandbox mounts ``component_source`` at /App.jsx and resolves its
+    relative imports from ``source_files``; a 3.0.7 host knows neither the
+    table nor the bundler feature, so the modules are concatenated instead:
+    external imports are hoisted (deduped by exact text), relative imports
+    dropped, ``export`` keywords stripped from modules (the entry keeps its
+    default export), and modules ordered by their import dependencies.
+    """
+    import re
+
+    files = {f["path"].lstrip("./"): f["content"] for f in source_files}
+    # Map without extension too, so "./utils/data.js" and "./utils/data" both hit.
+    def _lookup_key(resolved: str) -> str | None:
+        if resolved in files:
+            return resolved
+        for ext in (".jsx", ".js", ".ts", ".tsx"):
+            if resolved + ext in files:
+                return resolved + ext
+        return None
+
+    # Build dependency edges among source files.
+    deps: dict[str, set[str]] = {p: set() for p in files}
+    for path, code in files.items():
+        for _stmt, spec in _parse_imports(code):
+            if spec.startswith("."):
+                key = _lookup_key(_norm_module_path(path, spec))
+                if key:
+                    deps[path].add(key)
+
+    # Topological order (dependencies first); cycles fall back to name order.
+    ordered: list[str] = []
+    visiting: set[str] = set()
+
+    def _visit(node: str) -> None:
+        if node in ordered or node in visiting:
+            return
+        visiting.add(node)
+        for dep in sorted(deps.get(node, ())):
+            _visit(dep)
+        visiting.discard(node)
+        ordered.append(node)
+
+    for path in sorted(files):
+        _visit(path)
+
+    # Merge external imports per module specifier: modules each import their
+    # own slice of react/primitives, and duplicate default bindings ("React")
+    # would be a SyntaxError once inlined into one module scope.
+    merged: dict[str, dict[str, Any]] = {}  # spec -> {default, named:set, bare}
+
+    def _merge_import(stmt: str, spec: str) -> None:
+        entry_rec = merged.setdefault(spec, {"default": None, "named": set(), "bare": False})
+        m = re.match(r"import\s+(.*?)\s*from", stmt, re.DOTALL)
+        if not m:
+            entry_rec["bare"] = True
+            return
+        clause = m.group(1).strip()
+        named = re.search(r"\{([^}]*)\}", clause, re.DOTALL)
+        if named:
+            entry_rec["named"].update(n.strip() for n in named.group(1).split(",") if n.strip())
+            clause = clause[: named.start()].rstrip(", \n")
+        if clause and not clause.startswith("{"):
+            entry_rec["default"] = clause.strip(", ")
+
+    bodies: list[str] = []
+
+    def _strip(code: str, *, is_entry: bool) -> str:
+        for stmt, spec in _parse_imports(code):
+            if not spec.startswith("."):
+                _merge_import(stmt, spec)
+            code = code.replace(stmt, "")
+        if not is_entry:
+            # Named exports become plain declarations in the single module scope.
+            code = re.sub(r"^export\s+(?=(?:async\s+)?(?:function|const|let|var|class)\b)", "", code, flags=re.MULTILINE)
+            code = re.sub(r"^export\s+default\s+", "", code, flags=re.MULTILINE)
+            code = re.sub(r"^export\s*\{[^}]*\}\s*;?\s*$", "", code, flags=re.MULTILINE)
+        return code.strip()
+
+    for path in ordered:
+        bodies.append(f"// ---- inlined from {path} ----\n" + _strip(files[path], is_entry=False))
+    entry = _strip(component_source, is_entry=True)
+
+    import_lines: list[str] = []
+    for spec in sorted(merged):
+        rec = merged[spec]
+        parts = []
+        if rec["default"]:
+            parts.append(rec["default"])
+        if rec["named"]:
+            parts.append("{ " + ", ".join(sorted(rec["named"])) + " }")
+        if parts:
+            import_lines.append(f'import {", ".join(parts)} from "{spec}";')
+        elif rec["bare"]:
+            import_lines.append(f'import "{spec}";')
+
+    return "\n".join(import_lines) + "\n\n" + "\n\n".join(bodies) + "\n\n// ---- entry ----\n" + entry
+
+
+def shim_pull_data_component(component: str) -> tuple[str, list[dict[str, Any]]]:
+    """Port a 3.0.9 pull-based sandbox component to the 3.0.7 push contract.
+
+    3.0.9 components call ``useDoItems("Label", {limit})`` (a primitive that
+    pulls items over a request bridge); 3.0.7 has neither the primitive nor
+    the bridge — it pre-fetches items for the type's ``nav_sections`` into
+    ``ctx.do_items[label]``. This rewrites the component to that contract:
+
+    - collects every ``useDoItems`` label/limit and returns matching
+      ``nav_sections`` entries so the host prefetches them,
+    - removes ``useDoItems`` from the primitives import (3.0.7's validator
+      rejects unknown primitives),
+    - injects a local ``useDoItems`` returning ``{items, error, loading}``
+      from ``ctx.do_items``, with the ctx captured by wrapping the entry.
+    """
+    import re
+
+    calls: dict[str, int | None] = {}
+    for m in re.finditer(r"\buseDoItems\s*\(\s*([\"'])([^\"'\n]+)\1(?:\s*,\s*\{[^}]*?limit\s*:\s*(\d+))?", component):
+        label, limit = m.group(2), (int(m.group(3)) if m.group(3) else None)
+        prev = calls.get(label)
+        calls[label] = max(prev or 0, limit or 0) or None
+    if not calls:
+        return component, []
+
+    def _drop_use_do_items(mm: Any) -> str:
+        names = [n.strip() for n in mm.group(1).split(",") if n.strip() and n.strip() != "useDoItems"]
+        return f'import {{ {", ".join(names)} }} from "@artifact/primitives";' if names else ""
+
+    component = re.sub(
+        r"import\s*\{([^}]*)\}\s*from\s*[\"']@artifact/primitives[\"'];?",
+        _drop_use_do_items, component, count=1,
+    )
+
+    entry_match = re.search(r"export\s+default\s+function\s+\w*\s*\(", component)
+    if entry_match:
+        component = component.replace(entry_match.group(0), "function __UserEntry(", 1)
+        component += (
+            "\n\nexport default function App({ ctx }) {\n"
+            "  __sandboxCtx = ctx;\n"
+            "  return React.createElement(__UserEntry, { ctx });\n"
+            "}\n"
+        )
+    else:
+        print("  WARNING: could not locate the entry's default export to capture ctx; "
+              "useDoItems shim will see no data")
+
+    shim = (
+        "// ---- 3.0.7 compatibility shim: useDoItems reads host-prefetched ctx.do_items ----\n"
+        "let __sandboxCtx = null;\n"
+        "function useDoItems(label) {\n"
+        "  const items = (__sandboxCtx && __sandboxCtx.do_items && __sandboxCtx.do_items[label]) || [];\n"
+        "  return { items, error: null, loading: false };\n"
+        "}\n\n"
+    )
+    nav_sections = [
+        {"id": lbl, "display_name": lbl, "do_node_label": lbl, **({"limit": lim} if lim else {})}
+        for lbl, lim in sorted(calls.items())
+    ]
+    return shim + component, nav_sections
+
+
 def _create_type_payload(source: dict[str, Any], member_id_map: dict[str, str]) -> dict[str, Any]:
     """Build the POST /artifact-types payload from an exported type dict.
 
     Target scope is implicitly CUSTOM (the create endpoint has no scope field),
     which also covers 3.0.8 LIBRARY types imported into a 3.0.7 environment.
+
+    3.0.9 multi-file react_sandbox types (``source_files``) are flattened into
+    a single ``component_source``, since older hosts cannot store or bundle
+    the extra modules.
     """
+    component = source.get("component_source") or ""
+    source_files = source.get("source_files") or []
+    nav_sections = source.get("nav_sections") or []
+    if component and source_files:
+        print(f"  flattening {len(source_files)} source file(s) into component_source "
+              "(target host predates multi-file sandbox types)")
+        component = flatten_component(component, source_files)
+    if component and "useDoItems" in component:
+        component, synthesized = shim_pull_data_component(component)
+        if synthesized and not nav_sections:
+            nav_sections = synthesized
+            print(f"  shimmed useDoItems + synthesized {len(synthesized)} nav_section(s) "
+                  f"({', '.join(s['do_node_label'] for s in synthesized[:6])}...)")
     return {
         "key": source["key"],
         "name": source["name"],
         "template": source.get("template") or "",
         "nav_template": source.get("nav_template"),
-        "nav_sections": source.get("nav_sections") or [],
+        "nav_sections": nav_sections,
         "routine_names": source.get("routine_names") or [],
         "render_mode": source.get("render_mode") or "nunjucks",
-        "component_source": source.get("component_source") or "",
+        "component_source": component,
         "member_type_ids": [member_id_map.get(m, m) for m in (source.get("member_type_ids") or [])],
         "nav_layout": source.get("nav_layout") or "top",
         "lifecycle_status": source.get("lifecycle_status") or "published",
